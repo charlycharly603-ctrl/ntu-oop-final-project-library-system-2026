@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "Run LibraryApp",
+            "request": "launch",
+            "mainClass": "library.LibraryApp",
+            "cwd": "${workspaceFolder}",
+            "vmArgs": "-Dfile.encoding=UTF-8",
+            "classPaths": [
+                "${workspaceFolder}/out",
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/lib/mysql-connector-j-9.7.0.jar"
+            ],
+            "env": {
+                "LIB_DB_USER": "library_app",
+                "LIB_DB_PASSWORD": ""
+            }
+        }
+    ]
+}

@@ -1,0 +1,8 @@
+out/
+*.class
+.idea/
+mysql-installer-*.msi
+mysql-connector-j-*.zip
+mysql-connector-j-*/
+rendered_usage_clipping/
+*.docx
