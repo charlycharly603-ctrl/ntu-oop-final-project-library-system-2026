@@ -82,3 +82,38 @@ INSERT INTO book_isbns (book_id, isbn)
 SELECT book_id, '9780134685991' FROM books
 WHERE title = 'Effective Java'
   AND NOT EXISTS (SELECT 1 FROM book_isbns WHERE isbn = '9780134685991');
+
+INSERT INTO books (
+  title,
+  authors,
+  subjects,
+  publisher,
+  publish_year,
+  total_copies,
+  available_copies
+)
+SELECT seed.title, seed.authors, seed.subjects, seed.publisher, seed.publish_year,
+       seed.total_copies, seed.available_copies
+FROM (
+  SELECT '資料庫系統導論' AS title, '林建宏' AS authors, 'Database, SQL, Computer Science' AS subjects, '知識工坊' AS publisher, '2023' AS publish_year, 6 AS total_copies, 6 AS available_copies
+  UNION ALL SELECT 'Python 自動化實務', '陳怡君', 'Python, Automation, Programming', '科技人出版社', '2024', 4, 4
+  UNION ALL SELECT '人工智慧基礎', '張家豪', 'Artificial Intelligence, Machine Learning', '未來科技出版', '2025', 5, 5
+  UNION ALL SELECT '網頁前端開發入門', '黃柏翰', 'HTML, CSS, JavaScript, Web Development', '程式設計書房', '2022', 7, 7
+  UNION ALL SELECT '作業系統概論', '吳承恩', 'Operating System, Computer Science', '大學資訊出版', '2021', 3, 3
+  UNION ALL SELECT '現代經濟學', '李雅婷', 'Economics, Finance', '商學出版社', '2020', 5, 5
+  UNION ALL SELECT '行銷管理實務', '許志明', 'Marketing, Management, Business', '企業管理出版', '2023', 6, 6
+  UNION ALL SELECT '心理學與生活', '周佩珊', 'Psychology, Life Science', '人文知識館', '2022', 4, 4
+  UNION ALL SELECT '世界歷史概覽', '鄭文凱', 'History, World History', '博雅文化', '2019', 5, 5
+  UNION ALL SELECT '台灣地理與文化', '蔡明哲', 'Geography, Taiwan, Culture', '島嶼出版社', '2021', 6, 6
+  UNION ALL SELECT '基礎會計學', '郭佳穎', 'Accounting, Business', '財經教育出版', '2024', 4, 4
+  UNION ALL SELECT '英文閱讀技巧', '羅美玲', 'English, Reading, Language Learning', '語文學習出版社', '2020', 8, 8
+  UNION ALL SELECT '日語初級文法', '森田健一', 'Japanese, Grammar, Language Learning', '東亞語言出版', '2023', 5, 5
+  UNION ALL SELECT '健康飲食指南', '林佳蓉', 'Health, Nutrition, Food', '生活健康出版', '2022', 6, 6
+  UNION ALL SELECT '運動科學入門', '高志遠', 'Sports Science, Fitness, Health', '體育知識館', '2021', 3, 3
+  UNION ALL SELECT '環境保護與永續發展', '蘇冠宇', 'Environment, Sustainability', '綠色地球出版', '2024', 5, 5
+  UNION ALL SELECT '法律常識入門', '范庭萱', 'Law, Society', '公民教育出版', '2020', 4, 4
+  UNION ALL SELECT '攝影構圖技巧', '何俊毅', 'Photography, Art, Design', '影像藝術出版', '2023', 6, 6
+  UNION ALL SELECT '小說創作方法', '楊子晴', 'Writing, Literature, Novel', '文學創作坊', '2022', 5, 5
+  UNION ALL SELECT '投資理財基礎', '劉宗翰', 'Investment, Finance, Personal Finance', '財富管理出版', '2025', 4, 4
+) AS seed
+WHERE NOT EXISTS (SELECT 1 FROM books WHERE books.title = seed.title);
