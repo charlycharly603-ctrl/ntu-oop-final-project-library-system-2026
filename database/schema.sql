@@ -37,8 +37,23 @@ CREATE TABLE IF NOT EXISTS books (
   note TEXT,
   total_copies INT NOT NULL DEFAULT 1,
   available_copies INT NOT NULL DEFAULT 1,
+  status ENUM('AVAILABLE', 'ARCHIVED') NOT NULL DEFAULT 'AVAILABLE',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+SET @add_books_status := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE books ADD COLUMN status ENUM(''AVAILABLE'', ''ARCHIVED'') NOT NULL DEFAULT ''AVAILABLE'' AFTER available_copies',
+    'SELECT 1'
+  )
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'books'
+    AND COLUMN_NAME = 'status'
+);
+PREPARE add_books_status_stmt FROM @add_books_status;
+EXECUTE add_books_status_stmt;
+DEALLOCATE PREPARE add_books_status_stmt;
 
 CREATE TABLE IF NOT EXISTS book_isbns (
   isbn_id INT AUTO_INCREMENT PRIMARY KEY,

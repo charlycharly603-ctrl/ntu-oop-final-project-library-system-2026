@@ -9,4 +9,4 @@ if errorlevel 1 (
     exit /b 1
 )
 
-java -cp "out;lib\mysql-connector-j-9.7.0.jar" library.LibraryApp
+java -Dfile.encoding=UTF-8 -cp "out;lib\*" library.LibraryApp

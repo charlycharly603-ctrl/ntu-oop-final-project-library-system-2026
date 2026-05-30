@@ -10,14 +10,19 @@
 - 學生借書、還書、查看個人借閱紀錄
 - 逾期與即將到期提醒
 - 管理員查看所有借閱紀錄
-- 管理員新增書籍、下架書籍
-- 管理員停權與復權使用者
+- 管理員新增、編輯、下架與恢復上架書籍
+- 管理員調整館藏數量，且會防止館藏小於借出中數量
+- 管理員首頁統計館藏、借閱、逾期與停權狀態
+- 管理員可替學生登記還書
+- 管理員搜尋學生、查看借閱概況、停權與復權使用者
 
 ## 資料庫
 
 1. 安裝 MySQL。
 2. 執行 `database/schema.sql` 建立資料庫與示範資料。
 3. 下載 MySQL Connector/J，將 jar 放到 `lib/`。
+
+如果已經建立過舊版資料庫，請重新執行 `database/schema.sql`。它會替 `books` 補上 `status` 欄位，讓下架書籍可以保留歷史借閱紀錄。
 
 預設連線資訊：
 
@@ -37,13 +42,19 @@ PowerShell:
 
 ```powershell
 javac -encoding UTF-8 -d out src\library\LibraryApp.java
-java -cp "out;lib\mysql-connector-j-*.jar" library.LibraryApp
+java -Dfile.encoding=UTF-8 -cp "out;lib\*" library.LibraryApp
 ```
 
 或直接執行：
 
 ```powershell
 .\run.ps1
+```
+
+Windows Command Prompt 也可以執行：
+
+```bat
+run.bat
 ```
 
 它會直接編譯並啟動程式。

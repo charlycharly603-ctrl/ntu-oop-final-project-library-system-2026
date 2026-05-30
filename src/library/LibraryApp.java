@@ -10,7 +10,9 @@ import java.security.MessageDigest;
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 public class LibraryApp {
     public static void main(String[] args) {
@@ -33,7 +35,7 @@ record LoginSession(UserType type, int id, String account, String displayName, S
 }
 
 record Book(int id, String title, String authors, String subjects, String publisher, String publishYear,
-            String isbnList, int totalCopies, int availableCopies) {
+            String isbnList, int totalCopies, int availableCopies, String status) {
 }
 
 record BorrowRow(int recordId, String studentNo, String studentName, String title, Timestamp borrowDate,
@@ -50,6 +52,14 @@ record BorrowRow(int recordId, String studentNo, String studentName, String titl
         }
         return "借閱中";
     }
+}
+
+record UserRow(int id, String studentNo, String name, String roleLevel, String status, Timestamp createdAt,
+               int activeLoans, int totalLoans) {
+}
+
+record AdminStats(int totalBooks, int availableBooks, int archivedBooks, int activeLoans, int overdueLoans,
+                  int suspendedUsers) {
 }
 
 final class Db {
@@ -150,13 +160,18 @@ final class AuthService {
 
 final class LibraryService {
     List<Book> searchBooks(String keyword) throws SQLException {
+        return searchBooks(keyword, false);
+    }
+
+    List<Book> searchBooks(String keyword, boolean includeArchived) throws SQLException {
         String sql = """
                 SELECT b.book_id, b.title, b.authors, b.subjects, b.publisher, b.publish_year,
-                       b.total_copies, b.available_copies,
+                       b.total_copies, b.available_copies, b.status,
                        COALESCE(GROUP_CONCAT(i.isbn ORDER BY i.isbn SEPARATOR ', '), '') AS isbns
                 FROM books b
                 LEFT JOIN book_isbns i ON b.book_id = i.book_id
-                WHERE (? = ''
+                WHERE (? OR b.status = 'AVAILABLE')
+                  AND (? = ''
                    OR b.title LIKE ?
                    OR b.authors LIKE ?
                    OR b.subjects LIKE ?
@@ -167,8 +182,9 @@ final class LibraryService {
                 """;
         String like = "%" + keyword.trim() + "%";
         try (Connection conn = Db.connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, keyword.trim());
-            for (int i = 2; i <= 6; i++) {
+            ps.setBoolean(1, includeArchived);
+            ps.setString(2, keyword.trim());
+            for (int i = 3; i <= 7; i++) {
                 ps.setString(i, like);
             }
             try (ResultSet rs = ps.executeQuery()) {
@@ -176,7 +192,8 @@ final class LibraryService {
                 while (rs.next()) {
                     books.add(new Book(rs.getInt("book_id"), rs.getString("title"), rs.getString("authors"),
                             rs.getString("subjects"), rs.getString("publisher"), rs.getString("publish_year"),
-                            rs.getString("isbns"), rs.getInt("total_copies"), rs.getInt("available_copies")));
+                            rs.getString("isbns"), rs.getInt("total_copies"), rs.getInt("available_copies"),
+                            rs.getString("status")));
                 }
                 return books;
             }
@@ -191,15 +208,20 @@ final class LibraryService {
             conn.setAutoCommit(false);
             try {
                 int available;
+                String status;
                 try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT available_copies FROM books WHERE book_id = ? FOR UPDATE")) {
+                        "SELECT available_copies, status FROM books WHERE book_id = ? FOR UPDATE")) {
                     ps.setInt(1, bookId);
                     try (ResultSet rs = ps.executeQuery()) {
                         if (!rs.next()) {
                             throw new SQLException("找不到書籍");
                         }
                         available = rs.getInt("available_copies");
+                        status = rs.getString("status");
                     }
+                }
+                if (!"AVAILABLE".equals(status)) {
+                    throw new SQLException("此書已下架，無法借閱");
                 }
                 if (available <= 0) {
                     throw new SQLException("此書目前沒有可借複本");
@@ -264,6 +286,48 @@ final class LibraryService {
         }
     }
 
+    void returnBookForAdmin(int recordId) throws SQLException {
+        try (Connection conn = Db.connect()) {
+            conn.setAutoCommit(false);
+            try {
+                int bookId;
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        SELECT book_id FROM borrow_records
+                        WHERE record_id = ? AND return_date IS NULL
+                        FOR UPDATE
+                        """)) {
+                    ps.setInt(1, recordId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            throw new SQLException("找不到可歸還的借閱紀錄");
+                        }
+                        bookId = rs.getInt("book_id");
+                    }
+                }
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE borrow_records SET return_date = NOW() WHERE record_id = ?")) {
+                    ps.setInt(1, recordId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        UPDATE books
+                        SET available_copies = CASE
+                            WHEN status = 'AVAILABLE' THEN available_copies + 1
+                            ELSE available_copies
+                        END
+                        WHERE book_id = ?
+                        """)) {
+                    ps.setInt(1, bookId);
+                    ps.executeUpdate();
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                conn.rollback();
+                throw ex;
+            }
+        }
+    }
+
     List<BorrowRow> borrowRows(Integer userId) throws SQLException {
         String filter = userId == null ? "" : "WHERE r.user_id = ?";
         String sql = """
@@ -298,44 +362,159 @@ final class LibraryService {
         }
         try (Connection conn = Db.connect()) {
             conn.setAutoCommit(false);
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    INSERT INTO books (title, authors, subjects, publisher, publish_year, total_copies, available_copies)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, Statement.RETURN_GENERATED_KEYS)) {
-                ps.setString(1, title.trim());
-                ps.setString(2, authors.trim());
-                ps.setString(3, subjects.trim());
-                ps.setString(4, publisher.trim());
-                ps.setString(5, year.trim());
-                ps.setInt(6, copies);
-                ps.setInt(7, copies);
-                ps.executeUpdate();
-                try (ResultSet keys = ps.getGeneratedKeys()) {
-                    if (keys.next() && !isbn.isBlank()) {
-                        try (PreparedStatement isbnPs = conn.prepareStatement(
-                                "INSERT INTO book_isbns (book_id, isbn) VALUES (?, ?)")) {
-                            isbnPs.setInt(1, keys.getInt(1));
-                            isbnPs.setString(2, isbn.trim());
-                            isbnPs.executeUpdate();
+            try {
+                int bookId;
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        INSERT INTO books (title, authors, subjects, publisher, publish_year, total_copies, available_copies, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'AVAILABLE')
+                        """, Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, title.trim());
+                    ps.setString(2, authors.trim());
+                    ps.setString(3, subjects.trim());
+                    ps.setString(4, publisher.trim());
+                    ps.setString(5, year.trim());
+                    ps.setInt(6, copies);
+                    ps.setInt(7, copies);
+                    ps.executeUpdate();
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        if (!keys.next()) {
+                            throw new SQLException("新增書籍失敗，無法取得書籍 ID");
                         }
+                        bookId = keys.getInt(1);
                     }
                 }
+                insertIsbns(conn, bookId, isbn);
+                conn.commit();
+            } catch (SQLException ex) {
+                conn.rollback();
+                throw ex;
             }
-            conn.commit();
         }
     }
 
-    void removeBook(int bookId) throws SQLException {
-        try (Connection conn = Db.connect(); PreparedStatement ps = conn.prepareStatement(
-                "DELETE FROM books WHERE book_id = ? AND book_id NOT IN (SELECT book_id FROM borrow_records WHERE return_date IS NULL)")) {
-            ps.setInt(1, bookId);
-            if (ps.executeUpdate() == 0) {
-                throw new SQLException("書籍不存在，或仍有未歸還紀錄，無法下架");
+    void updateBook(int bookId, String title, String authors, String subjects, String publisher, String year,
+                    String isbn, int copies) throws SQLException {
+        if (title.isBlank() || authors.isBlank() || copies <= 0) {
+            throw new SQLException("書名、作者必填，館藏數量需大於 0");
+        }
+        try (Connection conn = Db.connect()) {
+            conn.setAutoCommit(false);
+            try {
+                String status;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT status FROM books WHERE book_id = ? FOR UPDATE")) {
+                    ps.setInt(1, bookId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            throw new SQLException("找不到書籍");
+                        }
+                        status = rs.getString("status");
+                    }
+                }
+                int activeLoans = activeLoanCount(conn, bookId);
+                if (copies < activeLoans) {
+                    throw new SQLException("館藏數量不可小於目前借出中的複本數：" + activeLoans);
+                }
+                int newAvailable = "ARCHIVED".equals(status) ? 0 : copies - activeLoans;
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        UPDATE books
+                        SET title = ?, authors = ?, subjects = ?, publisher = ?, publish_year = ?,
+                            total_copies = ?, available_copies = ?
+                        WHERE book_id = ?
+                        """)) {
+                    ps.setString(1, title.trim());
+                    ps.setString(2, authors.trim());
+                    ps.setString(3, subjects.trim());
+                    ps.setString(4, publisher.trim());
+                    ps.setString(5, year.trim());
+                    ps.setInt(6, copies);
+                    ps.setInt(7, newAvailable);
+                    ps.setInt(8, bookId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn.prepareStatement("DELETE FROM book_isbns WHERE book_id = ?")) {
+                    ps.setInt(1, bookId);
+                    ps.executeUpdate();
+                }
+                insertIsbns(conn, bookId, isbn);
+                conn.commit();
+            } catch (SQLException ex) {
+                conn.rollback();
+                throw ex;
+            }
+        }
+    }
+
+    void archiveBook(int bookId) throws SQLException {
+        try (Connection conn = Db.connect()) {
+            conn.setAutoCommit(false);
+            try {
+                String status;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT status FROM books WHERE book_id = ? FOR UPDATE")) {
+                    ps.setInt(1, bookId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            throw new SQLException("找不到書籍");
+                        }
+                        status = rs.getString("status");
+                    }
+                }
+                if ("ARCHIVED".equals(status)) {
+                    throw new SQLException("此書已經下架");
+                }
+                int activeLoans = activeLoanCount(conn, bookId);
+                if (activeLoans > 0) {
+                    throw new SQLException("仍有 " + activeLoans + " 本借出中，無法下架");
+                }
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE books SET status = 'ARCHIVED', available_copies = 0 WHERE book_id = ?")) {
+                    ps.setInt(1, bookId);
+                    ps.executeUpdate();
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                conn.rollback();
+                throw ex;
+            }
+        }
+    }
+
+    void restoreBook(int bookId) throws SQLException {
+        try (Connection conn = Db.connect()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT status FROM books WHERE book_id = ? FOR UPDATE")) {
+                    ps.setInt(1, bookId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next() || !"ARCHIVED".equals(rs.getString("status"))) {
+                            throw new SQLException("找不到已下架的書籍");
+                        }
+                    }
+                }
+                int activeLoans = activeLoanCount(conn, bookId);
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        UPDATE books
+                        SET status = 'AVAILABLE', available_copies = total_copies - ?
+                        WHERE book_id = ?
+                        """)) {
+                    ps.setInt(1, activeLoans);
+                    ps.setInt(2, bookId);
+                    ps.executeUpdate();
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                conn.rollback();
+                throw ex;
             }
         }
     }
 
     void updateUserStatus(String studentNo, String status) throws SQLException {
+        if (!"ACTIVE".equals(status) && !"SUSPENDED".equals(status)) {
+            throw new SQLException("帳號狀態不正確");
+        }
         try (Connection conn = Db.connect(); PreparedStatement ps = conn.prepareStatement(
                 "UPDATE users SET status = ? WHERE student_no = ?")) {
             ps.setString(1, status);
@@ -344,6 +523,98 @@ final class LibraryService {
                 throw new SQLException("找不到學生帳號");
             }
         }
+    }
+
+    List<UserRow> searchUsers(String keyword) throws SQLException {
+        String sql = """
+                SELECT u.user_id, u.student_no, u.name, u.role_level, u.status, u.created_at,
+                       COALESCE(SUM(CASE WHEN r.record_id IS NOT NULL AND r.return_date IS NULL THEN 1 ELSE 0 END), 0) AS active_loans,
+                       COUNT(r.record_id) AS total_loans
+                FROM users u
+                LEFT JOIN borrow_records r ON u.user_id = r.user_id
+                WHERE (? = ''
+                   OR u.student_no LIKE ?
+                   OR u.name LIKE ?
+                   OR u.role_level LIKE ?
+                   OR u.status LIKE ?)
+                GROUP BY u.user_id
+                ORDER BY u.student_no
+                """;
+        String trimmed = keyword.trim();
+        String like = "%" + trimmed + "%";
+        try (Connection conn = Db.connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, trimmed);
+            for (int i = 2; i <= 5; i++) {
+                ps.setString(i, like);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                List<UserRow> users = new ArrayList<>();
+                while (rs.next()) {
+                    users.add(new UserRow(rs.getInt("user_id"), rs.getString("student_no"), rs.getString("name"),
+                            rs.getString("role_level"), rs.getString("status"), rs.getTimestamp("created_at"),
+                            rs.getInt("active_loans"), rs.getInt("total_loans")));
+                }
+                return users;
+            }
+        }
+    }
+
+    AdminStats adminStats() throws SQLException {
+        String sql = """
+                SELECT
+                    (SELECT COUNT(*) FROM books) AS total_books,
+                    (SELECT COUNT(*) FROM books WHERE status = 'AVAILABLE') AS available_books,
+                    (SELECT COUNT(*) FROM books WHERE status = 'ARCHIVED') AS archived_books,
+                    (SELECT COUNT(*) FROM borrow_records WHERE return_date IS NULL) AS active_loans,
+                    (SELECT COUNT(*) FROM borrow_records WHERE return_date IS NULL AND due_date < NOW()) AS overdue_loans,
+                    (SELECT COUNT(*) FROM users WHERE status = 'SUSPENDED') AS suspended_users
+                """;
+        try (Connection conn = Db.connect(); PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            return new AdminStats(rs.getInt("total_books"), rs.getInt("available_books"),
+                    rs.getInt("archived_books"), rs.getInt("active_loans"), rs.getInt("overdue_loans"),
+                    rs.getInt("suspended_users"));
+        }
+    }
+
+    private void insertIsbns(Connection conn, int bookId, String isbnText) throws SQLException {
+        List<String> isbns = normalizeIsbns(isbnText);
+        if (isbns.isEmpty()) {
+            return;
+        }
+        try (PreparedStatement ps = conn.prepareStatement("INSERT INTO book_isbns (book_id, isbn) VALUES (?, ?)")) {
+            for (String isbn : isbns) {
+                ps.setInt(1, bookId);
+                ps.setString(2, isbn);
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+    }
+
+    private int activeLoanCount(Connection conn, int bookId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT COUNT(*) FROM borrow_records WHERE book_id = ? AND return_date IS NULL")) {
+            ps.setInt(1, bookId);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        }
+    }
+
+    private List<String> normalizeIsbns(String isbnText) {
+        Set<String> unique = new LinkedHashSet<>();
+        if (isbnText != null) {
+            for (String raw : isbnText.split("[,;\\r\\n]+")) {
+                String isbn = raw.trim();
+                if (!isbn.isBlank()) {
+                    unique.add(isbn);
+                }
+            }
+        }
+        return new ArrayList<>(unique);
     }
 }
 
@@ -620,11 +891,21 @@ final class StudentPanel extends JPanel {
 
 final class AdminPanel extends JPanel {
     private final LibraryService service;
-    private final DefaultTableModel booksModel = Ui.model("ID", "書名", "作者", "主題", "出版社", "年份", "ISBN", "館藏", "可借");
+    private final DefaultTableModel booksModel = Ui.model("ID", "書名", "作者", "主題", "出版社", "年份", "ISBN", "館藏", "可借", "狀態");
     private final DefaultTableModel recordsModel = Ui.model("紀錄ID", "學號", "姓名", "書名", "借出時間", "到期時間", "歸還時間", "天數", "狀態");
+    private final DefaultTableModel usersModel = Ui.model("ID", "學號", "姓名", "身分", "狀態", "借閱中", "歷史借閱", "建立時間");
     private final JTable booksTable = new JTable(booksModel);
     private final JTable recordsTable = new JTable(recordsModel);
+    private final JTable usersTable = new JTable(usersModel);
     private final JTextField keyword = new JTextField();
+    private final JTextField userKeyword = new JTextField();
+    private final List<Book> currentBooks = new ArrayList<>();
+    private final JLabel totalBooksValue = new JLabel("-");
+    private final JLabel availableBooksValue = new JLabel("-");
+    private final JLabel archivedBooksValue = new JLabel("-");
+    private final JLabel activeLoansValue = new JLabel("-");
+    private final JLabel overdueLoansValue = new JLabel("-");
+    private final JLabel suspendedUsersValue = new JLabel("-");
 
     AdminPanel(MainFrame frame, LoginSession session, LibraryService service) {
         this.service = service;
@@ -633,24 +914,35 @@ final class AdminPanel extends JPanel {
 
         CardLayout contentLayout = new CardLayout();
         JPanel content = new JPanel(contentLayout);
+        content.add(dashboardTab(), "dashboard");
         content.add(booksTab(), "books");
         content.add(recordsTab(), "records");
         content.add(usersTab(), "users");
 
         JPanel sidebar = Ui.sidebar("管理後台", "館員模式");
         sidebar.add(Ui.sidebarInfo(session.displayName(), "ADMIN"));
+        JButton dashboard = Ui.navButton("管理首頁");
         JButton books = Ui.navButton("書籍管理");
         JButton records = Ui.navButton("借閱紀錄");
         JButton users = Ui.navButton("帳號狀態");
         JButton logout = Ui.navButton("登出");
+        dashboard.addActionListener(e -> {
+            refreshDashboard();
+            contentLayout.show(content, "dashboard");
+        });
         books.addActionListener(e -> contentLayout.show(content, "books"));
         records.addActionListener(e -> {
             refreshRecords();
             contentLayout.show(content, "records");
         });
-        users.addActionListener(e -> contentLayout.show(content, "users"));
+        users.addActionListener(e -> {
+            refreshUsers();
+            contentLayout.show(content, "users");
+        });
         logout.addActionListener(e -> frame.showLogin());
         sidebar.add(Box.createVerticalStrut(18));
+        sidebar.add(dashboard);
+        sidebar.add(Box.createVerticalStrut(10));
         sidebar.add(books);
         sidebar.add(Box.createVerticalStrut(10));
         sidebar.add(records);
@@ -664,8 +956,43 @@ final class AdminPanel extends JPanel {
         Ui.styleTree(this);
         Ui.styleTable(booksTable);
         Ui.styleTable(recordsTable);
+        Ui.styleTable(usersTable);
+        refreshDashboard();
         refreshBooks();
         refreshRecords();
+        refreshUsers();
+    }
+
+    private JPanel dashboardTab() {
+        JPanel panel = Ui.page("管理首頁", "查看目前館藏、借閱與帳號狀態。");
+        panel.add(Ui.pageHeader("管理首頁", "查看目前館藏、借閱與帳號狀態。"), BorderLayout.NORTH);
+        JPanel stats = new JPanel(new GridLayout(2, 3, 14, 14));
+        stats.add(statCard("館藏書目", totalBooksValue));
+        stats.add(statCard("可借書目", availableBooksValue));
+        stats.add(statCard("已下架", archivedBooksValue));
+        stats.add(statCard("借閱中", activeLoansValue));
+        stats.add(statCard("逾期中", overdueLoansValue));
+        stats.add(statCard("停權學生", suspendedUsersValue));
+        JButton refresh = new JButton("重新整理");
+        JPanel actions = Ui.actionBar();
+        actions.add(refresh);
+        panel.add(stats, BorderLayout.CENTER);
+        panel.add(actions, BorderLayout.SOUTH);
+        refresh.addActionListener(e -> refreshDashboard());
+        return panel;
+    }
+
+    private JPanel statCard(String title, JLabel value) {
+        JPanel card = new JPanel(new BorderLayout(0, 10));
+        card.setBorder(BorderFactory.createCompoundBorder(
+                new PixelBorder(Ui.STONE_DARK, Ui.GOLD, 3),
+                new EmptyBorder(18, 18, 18, 18)));
+        JLabel label = new JLabel(title);
+        label.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 16));
+        value.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 36));
+        card.add(label, BorderLayout.NORTH);
+        card.add(value, BorderLayout.CENTER);
+        return card;
     }
 
     private JPanel booksTab() {
@@ -675,10 +1002,14 @@ final class AdminPanel extends JPanel {
         JLabel searchLabel = new JLabel("關鍵字");
         JButton search = new JButton("查詢");
         JButton add = new JButton("新增書籍");
-        JButton remove = new JButton("下架選取書籍");
+        JButton edit = new JButton("編輯書籍");
+        JButton archive = new JButton("下架書籍");
+        JButton restore = new JButton("恢復上架");
         JPanel buttons = Ui.actionBar();
         buttons.add(add);
-        buttons.add(remove);
+        buttons.add(edit);
+        buttons.add(archive);
+        buttons.add(restore);
         searchRow.add(searchLabel, BorderLayout.WEST);
         searchRow.add(keyword, BorderLayout.CENTER);
         searchRow.add(search, BorderLayout.EAST);
@@ -688,15 +1019,36 @@ final class AdminPanel extends JPanel {
         panel.add(new JScrollPane(booksTable), BorderLayout.CENTER);
         panel.add(buttons, BorderLayout.SOUTH);
         search.addActionListener(e -> refreshBooks());
-        add.addActionListener(e -> new AddBookDialog(SwingUtilities.getWindowAncestor(this), service, this::refreshBooks).setVisible(true));
-        remove.addActionListener(e -> {
-            Integer bookId = Ui.selectedInt(booksTable, 0);
-            if (bookId == null) {
+        add.addActionListener(e -> new AddBookDialog(SwingUtilities.getWindowAncestor(this), service, this::refreshBookViews).setVisible(true));
+        edit.addActionListener(e -> {
+            Book book = selectedBook();
+            if (book == null) {
+                return;
+            }
+            new EditBookDialog(SwingUtilities.getWindowAncestor(this), service, book, this::refreshBookViews).setVisible(true);
+        });
+        archive.addActionListener(e -> {
+            Book book = selectedBook();
+            if (book == null) {
                 return;
             }
             try {
-                service.removeBook(bookId);
-                refreshBooks();
+                service.archiveBook(book.id());
+                refreshBookViews();
+                Dialogs.info(this, "下架成功");
+            } catch (SQLException ex) {
+                Dialogs.error(this, ex);
+            }
+        });
+        restore.addActionListener(e -> {
+            Book book = selectedBook();
+            if (book == null) {
+                return;
+            }
+            try {
+                service.restoreBook(book.id());
+                refreshBookViews();
+                Dialogs.info(this, "恢復上架成功");
             } catch (SQLException ex) {
                 Dialogs.error(this, ex);
             }
@@ -708,58 +1060,111 @@ final class AdminPanel extends JPanel {
         JPanel panel = Ui.page("借閱紀錄查詢", "檢視所有學生的借閱、歸還與逾期狀態。");
         panel.add(Ui.pageHeader("借閱紀錄查詢", "檢視所有學生的借閱、歸還與逾期狀態。"), BorderLayout.NORTH);
         JButton refresh = new JButton("重新整理");
+        JButton returns = new JButton("登記還書");
         JPanel actions = Ui.actionBar();
         actions.add(refresh);
+        actions.add(returns);
         panel.add(new JScrollPane(recordsTable), BorderLayout.CENTER);
         panel.add(actions, BorderLayout.SOUTH);
         refresh.addActionListener(e -> refreshRecords());
+        returns.addActionListener(e -> {
+            Integer recordId = Ui.selectedInt(recordsTable, 0);
+            if (recordId == null) {
+                return;
+            }
+            try {
+                service.returnBookForAdmin(recordId);
+                refreshRecords();
+                refreshBookViews();
+                Dialogs.info(this, "登記還書成功");
+            } catch (SQLException ex) {
+                Dialogs.error(this, ex);
+            }
+        });
         return panel;
     }
 
     private JPanel usersTab() {
-        JPanel panel = Ui.page("帳號停權與復權", "輸入學生學號後，可以停權或恢復帳號登入權限。");
-        JPanel top = new JPanel(new BorderLayout());
-        top.add(Ui.pageHeader("帳號停權與復權", "輸入學生學號後，可以停權或恢復帳號登入權限。"), BorderLayout.NORTH);
-        JPanel form = new JPanel(new GridBagLayout());
-        form.setBorder(new PixelBorder(Ui.STONE_DARK, Ui.GOLD, 3));
-        GridBagConstraints c = new GridBagConstraints();
-        c.insets = new Insets(12, 12, 12, 12);
-        c.fill = GridBagConstraints.HORIZONTAL;
-        JTextField studentNo = new JTextField(18);
+        JPanel panel = Ui.page("帳號狀態管理", "搜尋學生帳號，查看借閱概況並停權或復權。");
+        JPanel topStack = new JPanel(new BorderLayout(0, 10));
+        JPanel searchRow = Ui.toolbar();
+        JLabel searchLabel = new JLabel("關鍵字");
+        JButton search = new JButton("查詢");
         JButton suspend = new JButton("停權");
         JButton activate = new JButton("復權");
-        c.gridx = 0;
-        c.gridy = 0;
-        form.add(new JLabel("學生學號"), c);
-        c.gridx = 1;
-        form.add(studentNo, c);
-        c.gridx = 0;
-        c.gridy = 1;
-        form.add(suspend, c);
-        c.gridx = 1;
-        form.add(activate, c);
-        top.add(form, BorderLayout.SOUTH);
-        panel.add(top, BorderLayout.NORTH);
-        suspend.addActionListener(e -> updateStatus(studentNo.getText(), "SUSPENDED"));
-        activate.addActionListener(e -> updateStatus(studentNo.getText(), "ACTIVE"));
+        JPanel actions = Ui.actionBar();
+        actions.add(suspend);
+        actions.add(activate);
+        searchRow.add(searchLabel, BorderLayout.WEST);
+        searchRow.add(userKeyword, BorderLayout.CENTER);
+        searchRow.add(search, BorderLayout.EAST);
+        topStack.add(Ui.pageHeader("帳號狀態管理", "搜尋學生帳號，查看借閱概況並停權或復權。"), BorderLayout.NORTH);
+        topStack.add(searchRow, BorderLayout.SOUTH);
+        panel.add(topStack, BorderLayout.NORTH);
+        panel.add(new JScrollPane(usersTable), BorderLayout.CENTER);
+        panel.add(actions, BorderLayout.SOUTH);
+        search.addActionListener(e -> refreshUsers());
+        suspend.addActionListener(e -> updateSelectedUserStatus("SUSPENDED"));
+        activate.addActionListener(e -> updateSelectedUserStatus("ACTIVE"));
         return panel;
+    }
+
+    private Book selectedBook() {
+        int row = booksTable.getSelectedRow();
+        if (row < 0) {
+            Dialogs.info(booksTable, "請先選取一筆書籍");
+            return null;
+        }
+        int modelRow = booksTable.convertRowIndexToModel(row);
+        return currentBooks.get(modelRow);
+    }
+
+    private void updateSelectedUserStatus(String status) {
+        String studentNo = Ui.selectedString(usersTable, 1);
+        if (studentNo == null) {
+            return;
+        }
+        updateStatus(studentNo, status);
     }
 
     private void updateStatus(String studentNo, String status) {
         try {
             service.updateUserStatus(studentNo, status);
+            refreshUsers();
+            refreshDashboard();
             Dialogs.info(this, "更新成功");
         } catch (SQLException ex) {
             Dialogs.error(this, ex);
         }
     }
 
+    private void refreshDashboard() {
+        try {
+            AdminStats stats = service.adminStats();
+            totalBooksValue.setText(String.valueOf(stats.totalBooks()));
+            availableBooksValue.setText(String.valueOf(stats.availableBooks()));
+            archivedBooksValue.setText(String.valueOf(stats.archivedBooks()));
+            activeLoansValue.setText(String.valueOf(stats.activeLoans()));
+            overdueLoansValue.setText(String.valueOf(stats.overdueLoans()));
+            suspendedUsersValue.setText(String.valueOf(stats.suspendedUsers()));
+        } catch (SQLException ex) {
+            Dialogs.error(this, ex);
+        }
+    }
+
+    private void refreshBookViews() {
+        refreshBooks();
+        refreshDashboard();
+    }
+
     private void refreshBooks() {
         try {
             booksModel.setRowCount(0);
-            for (Book b : service.searchBooks(keyword.getText())) {
+            currentBooks.clear();
+            for (Book b : service.searchBooks(keyword.getText(), true)) {
+                currentBooks.add(b);
                 booksModel.addRow(new Object[]{b.id(), b.title(), b.authors(), b.subjects(), b.publisher(),
-                        b.publishYear(), b.isbnList(), b.totalCopies(), b.availableCopies()});
+                        b.publishYear(), b.isbnList(), b.totalCopies(), b.availableCopies(), bookStatusText(b.status())});
             }
         } catch (SQLException ex) {
             Dialogs.error(this, ex);
@@ -776,6 +1181,26 @@ final class AdminPanel extends JPanel {
         } catch (SQLException ex) {
             Dialogs.error(this, ex);
         }
+    }
+
+    private void refreshUsers() {
+        try {
+            usersModel.setRowCount(0);
+            for (UserRow u : service.searchUsers(userKeyword.getText())) {
+                usersModel.addRow(new Object[]{u.id(), u.studentNo(), u.name(), u.roleLevel(),
+                        userStatusText(u.status()), u.activeLoans(), u.totalLoans(), u.createdAt()});
+            }
+        } catch (SQLException ex) {
+            Dialogs.error(this, ex);
+        }
+    }
+
+    private String bookStatusText(String status) {
+        return "ARCHIVED".equals(status) ? "已下架" : "可借閱";
+    }
+
+    private String userStatusText(String status) {
+        return "SUSPENDED".equals(status) ? "停權" : "正常";
     }
 }
 
@@ -801,7 +1226,7 @@ final class AddBookDialog extends JDialog {
         form.add(publisher);
         form.add(new JLabel("出版年"));
         form.add(year);
-        form.add(new JLabel("ISBN"));
+        form.add(new JLabel("ISBN（可用逗號分隔）"));
         form.add(isbn);
         form.add(new JLabel("館藏數量"));
         form.add(copies);
@@ -813,6 +1238,53 @@ final class AddBookDialog extends JDialog {
             try {
                 service.addBook(title.getText(), authors.getText(), subjects.getText(), publisher.getText(),
                         year.getText(), isbn.getText(), (Integer) copies.getValue());
+                afterSave.run();
+                dispose();
+            } catch (SQLException ex) {
+                Dialogs.error(this, ex);
+            }
+        });
+        cancel.addActionListener(e -> dispose());
+        Ui.styleTree(form);
+        pack();
+        setLocationRelativeTo(owner);
+    }
+}
+
+final class EditBookDialog extends JDialog {
+    EditBookDialog(Window owner, LibraryService service, Book book, Runnable afterSave) {
+        super(owner, "編輯書籍", ModalityType.APPLICATION_MODAL);
+        JPanel form = Ui.dialogPanel(8, 2);
+        setContentPane(form);
+        JTextField title = new JTextField(book.title());
+        JTextField authors = new JTextField(book.authors());
+        JTextField subjects = new JTextField(book.subjects());
+        JTextField publisher = new JTextField(book.publisher());
+        JTextField year = new JTextField(book.publishYear());
+        JTextField isbn = new JTextField(book.isbnList());
+        JSpinner copies = new JSpinner(new SpinnerNumberModel(book.totalCopies(), 1, 999, 1));
+        form.add(new JLabel("書名"));
+        form.add(title);
+        form.add(new JLabel("作者"));
+        form.add(authors);
+        form.add(new JLabel("主題"));
+        form.add(subjects);
+        form.add(new JLabel("出版社"));
+        form.add(publisher);
+        form.add(new JLabel("出版年"));
+        form.add(year);
+        form.add(new JLabel("ISBN（可用逗號分隔）"));
+        form.add(isbn);
+        form.add(new JLabel("館藏數量"));
+        form.add(copies);
+        JButton ok = new JButton("儲存");
+        JButton cancel = new JButton("取消");
+        form.add(ok);
+        form.add(cancel);
+        ok.addActionListener(e -> {
+            try {
+                service.updateBook(book.id(), title.getText(), authors.getText(), subjects.getText(),
+                        publisher.getText(), year.getText(), isbn.getText(), (Integer) copies.getValue());
                 afterSave.run();
                 dispose();
             } catch (SQLException ex) {
@@ -1037,6 +1509,17 @@ final class Ui {
         }
         int modelRow = table.convertRowIndexToModel(row);
         return (Integer) table.getModel().getValueAt(modelRow, column);
+    }
+
+    static String selectedString(JTable table, int column) {
+        int row = table.getSelectedRow();
+        if (row < 0) {
+            Dialogs.info(table, "請先選取一列");
+            return null;
+        }
+        int modelRow = table.convertRowIndexToModel(row);
+        Object value = table.getModel().getValueAt(modelRow, column);
+        return value == null ? "" : value.toString();
     }
 
     static void styleTree(Component component) {
