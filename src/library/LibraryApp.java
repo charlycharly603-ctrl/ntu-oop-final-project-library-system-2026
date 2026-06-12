@@ -9,6 +9,7 @@ import java.awt.*;
 import java.security.MessageDigest;
 import java.sql.*;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -40,17 +41,43 @@ record Book(int id, String title, String authors, String subjects, String publis
 
 record BorrowRow(int recordId, String studentNo, String studentName, String title, Timestamp borrowDate,
                  Timestamp dueDate, Timestamp returnDate, int borrowDays) {
+    static final int FINE_PER_DAY = 5;
+
+    int overdueDays() {
+        LocalDateTime end = returnDate == null ? LocalDateTime.now() : returnDate.toLocalDateTime();
+        long days = ChronoUnit.DAYS.between(dueDate.toLocalDateTime().toLocalDate(), end.toLocalDate());
+        return Math.max(0, (int) days);
+    }
+
+    int fineAmount() {
+        return overdueDays() * FINE_PER_DAY;
+    }
+
+    String fineText() {
+        return fineAmount() == 0 ? "-" : fineAmount() + " 元";
+    }
+
     String statusText() {
         if (returnDate != null) {
-            return "已歸還";
+            return overdueDays() > 0 ? "已歸還（曾逾期 " + overdueDays() + " 天）" : "已歸還";
         }
-        if (dueDate.toLocalDateTime().isBefore(LocalDateTime.now())) {
-            return "逾期";
+        int overdueDays = overdueDays();
+        if (overdueDays > 0) {
+            return "逾期 " + overdueDays + " 天";
         }
         if (!dueDate.toLocalDateTime().isAfter(LocalDateTime.now().plusDays(3))) {
             return "即將到期";
         }
         return "借閱中";
+    }
+}
+
+record ReturnResult(int overdueDays, int fineAmount) {
+    String message(String successText) {
+        if (overdueDays <= 0) {
+            return successText;
+        }
+        return successText + "\n此書逾期 " + overdueDays + " 天，模擬罰款 " + fineAmount + " 元。";
     }
 }
 
@@ -249,13 +276,14 @@ final class LibraryService {
         }
     }
 
-    void returnBook(int userId, int recordId) throws SQLException {
+    ReturnResult returnBook(int userId, int recordId) throws SQLException {
         try (Connection conn = Db.connect()) {
             conn.setAutoCommit(false);
             try {
                 int bookId;
+                Timestamp dueDate;
                 try (PreparedStatement ps = conn.prepareStatement("""
-                        SELECT book_id FROM borrow_records
+                        SELECT book_id, due_date FROM borrow_records
                         WHERE record_id = ? AND user_id = ? AND return_date IS NULL
                         FOR UPDATE
                         """)) {
@@ -266,6 +294,7 @@ final class LibraryService {
                             throw new SQLException("找不到可歸還的借閱紀錄");
                         }
                         bookId = rs.getInt("book_id");
+                        dueDate = rs.getTimestamp("due_date");
                     }
                 }
                 try (PreparedStatement ps = conn.prepareStatement(
@@ -278,7 +307,9 @@ final class LibraryService {
                     ps.setInt(1, bookId);
                     ps.executeUpdate();
                 }
+                ReturnResult result = returnResult(dueDate);
                 conn.commit();
+                return result;
             } catch (SQLException ex) {
                 conn.rollback();
                 throw ex;
@@ -286,13 +317,14 @@ final class LibraryService {
         }
     }
 
-    void returnBookForAdmin(int recordId) throws SQLException {
+    ReturnResult returnBookForAdmin(int recordId) throws SQLException {
         try (Connection conn = Db.connect()) {
             conn.setAutoCommit(false);
             try {
                 int bookId;
+                Timestamp dueDate;
                 try (PreparedStatement ps = conn.prepareStatement("""
-                        SELECT book_id FROM borrow_records
+                        SELECT book_id, due_date FROM borrow_records
                         WHERE record_id = ? AND return_date IS NULL
                         FOR UPDATE
                         """)) {
@@ -302,6 +334,7 @@ final class LibraryService {
                             throw new SQLException("找不到可歸還的借閱紀錄");
                         }
                         bookId = rs.getInt("book_id");
+                        dueDate = rs.getTimestamp("due_date");
                     }
                 }
                 try (PreparedStatement ps = conn.prepareStatement(
@@ -320,7 +353,9 @@ final class LibraryService {
                     ps.setInt(1, bookId);
                     ps.executeUpdate();
                 }
+                ReturnResult result = returnResult(dueDate);
                 conn.commit();
+                return result;
             } catch (SQLException ex) {
                 conn.rollback();
                 throw ex;
@@ -604,6 +639,12 @@ final class LibraryService {
         }
     }
 
+    private ReturnResult returnResult(Timestamp dueDate) {
+        long days = ChronoUnit.DAYS.between(dueDate.toLocalDateTime().toLocalDate(), LocalDateTime.now().toLocalDate());
+        int overdueDays = Math.max(0, (int) days);
+        return new ReturnResult(overdueDays, overdueDays * BorrowRow.FINE_PER_DAY);
+    }
+
     private List<String> normalizeIsbns(String isbnText) {
         Set<String> unique = new LinkedHashSet<>();
         if (isbnText != null) {
@@ -754,7 +795,7 @@ final class StudentPanel extends JPanel {
     private final LoginSession session;
     private final LibraryService service;
     private final DefaultTableModel booksModel = Ui.model("ID", "書名", "作者", "主題", "出版社", "年份", "ISBN", "館藏", "可借");
-    private final DefaultTableModel recordsModel = Ui.model("紀錄ID", "書名", "借出時間", "到期時間", "歸還時間", "天數", "狀態");
+    private final DefaultTableModel recordsModel = Ui.model("紀錄ID", "書名", "借出時間", "到期時間", "歸還時間", "天數", "逾期天數", "模擬罰款", "狀態");
     private final JTable booksTable = new JTable(booksModel);
     private final JTable recordsTable = new JTable(recordsModel);
     private final JTextField keyword = new JTextField();
@@ -853,10 +894,10 @@ final class StudentPanel extends JPanel {
                 return;
             }
             try {
-                service.returnBook(session.id(), recordId);
+                ReturnResult result = service.returnBook(session.id(), recordId);
                 refreshBooks();
                 refreshRecords();
-                Dialogs.info(this, "還書成功");
+                Dialogs.info(this, result.message("還書成功"));
             } catch (SQLException ex) {
                 Dialogs.error(this, ex);
             }
@@ -881,7 +922,7 @@ final class StudentPanel extends JPanel {
             recordsModel.setRowCount(0);
             for (BorrowRow r : service.borrowRows(session.id())) {
                 recordsModel.addRow(new Object[]{r.recordId(), r.title(), r.borrowDate(), r.dueDate(),
-                        r.returnDate(), r.borrowDays(), r.statusText()});
+                        r.returnDate(), r.borrowDays(), r.overdueDays(), r.fineText(), r.statusText()});
             }
         } catch (SQLException ex) {
             Dialogs.error(this, ex);
@@ -892,7 +933,7 @@ final class StudentPanel extends JPanel {
 final class AdminPanel extends JPanel {
     private final LibraryService service;
     private final DefaultTableModel booksModel = Ui.model("ID", "書名", "作者", "主題", "出版社", "年份", "ISBN", "館藏", "可借", "狀態");
-    private final DefaultTableModel recordsModel = Ui.model("紀錄ID", "學號", "姓名", "書名", "借出時間", "到期時間", "歸還時間", "天數", "狀態");
+    private final DefaultTableModel recordsModel = Ui.model("紀錄ID", "學號", "姓名", "書名", "借出時間", "到期時間", "歸還時間", "天數", "逾期天數", "模擬罰款", "狀態");
     private final DefaultTableModel usersModel = Ui.model("ID", "學號", "姓名", "身分", "狀態", "借閱中", "歷史借閱", "建立時間");
     private final JTable booksTable = new JTable(booksModel);
     private final JTable recordsTable = new JTable(recordsModel);
@@ -1073,10 +1114,10 @@ final class AdminPanel extends JPanel {
                 return;
             }
             try {
-                service.returnBookForAdmin(recordId);
+                ReturnResult result = service.returnBookForAdmin(recordId);
                 refreshRecords();
                 refreshBookViews();
-                Dialogs.info(this, "登記還書成功");
+                Dialogs.info(this, result.message("登記還書成功"));
             } catch (SQLException ex) {
                 Dialogs.error(this, ex);
             }
@@ -1176,7 +1217,8 @@ final class AdminPanel extends JPanel {
             recordsModel.setRowCount(0);
             for (BorrowRow r : service.borrowRows(null)) {
                 recordsModel.addRow(new Object[]{r.recordId(), r.studentNo(), r.studentName(), r.title(),
-                        r.borrowDate(), r.dueDate(), r.returnDate(), r.borrowDays(), r.statusText()});
+                        r.borrowDate(), r.dueDate(), r.returnDate(), r.borrowDays(), r.overdueDays(),
+                        r.fineText(), r.statusText()});
             }
         } catch (SQLException ex) {
             Dialogs.error(this, ex);
