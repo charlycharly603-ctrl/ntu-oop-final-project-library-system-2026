@@ -81,6 +81,19 @@ record ReturnResult(int overdueDays, int fineAmount) {
     }
 }
 
+record BorrowPolicy(String roleLevel, int maxLoans) {
+    static BorrowPolicy forRole(String roleLevel) {
+        if ("VIP".equalsIgnoreCase(roleLevel)) {
+            return new BorrowPolicy("VIP", 6);
+        }
+        return new BorrowPolicy("NORMAL", 3);
+    }
+
+    String limitMessage(int activeLoans) {
+        return roleLevel + " 使用者最多同時借閱 " + maxLoans + " 本，目前已借 " + activeLoans + " 本。";
+    }
+}
+
 record UserRow(int id, String studentNo, String name, String roleLevel, String status, Timestamp createdAt,
                int activeLoans, int totalLoans) {
 }
@@ -234,6 +247,12 @@ final class LibraryService {
         try (Connection conn = Db.connect()) {
             conn.setAutoCommit(false);
             try {
+                BorrowPolicy policy = borrowPolicy(conn, userId);
+                int activeUserLoans = activeUserLoanCount(conn, userId);
+                if (activeUserLoans >= policy.maxLoans()) {
+                    throw new SQLException(policy.limitMessage(activeUserLoans));
+                }
+
                 int available;
                 String status;
                 try (PreparedStatement ps = conn.prepareStatement(
@@ -639,6 +658,33 @@ final class LibraryService {
         }
     }
 
+    private BorrowPolicy borrowPolicy(Connection conn, int userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT role_level, status FROM users WHERE user_id = ?")) {
+            ps.setInt(1, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    throw new SQLException("找不到使用者");
+                }
+                if (!"ACTIVE".equals(rs.getString("status"))) {
+                    throw new SQLException("此學生帳號已被停權，無法借書");
+                }
+                return BorrowPolicy.forRole(rs.getString("role_level"));
+            }
+        }
+    }
+
+    private int activeUserLoanCount(Connection conn, int userId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT COUNT(*) FROM borrow_records WHERE user_id = ? AND return_date IS NULL")) {
+            ps.setInt(1, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        }
+    }
+
     private ReturnResult returnResult(Timestamp dueDate) {
         long days = ChronoUnit.DAYS.between(dueDate.toLocalDateTime().toLocalDate(), LocalDateTime.now().toLocalDate());
         int overdueDays = Math.max(0, (int) days);
@@ -799,6 +845,10 @@ final class StudentPanel extends JPanel {
     private final JTable booksTable = new JTable(booksModel);
     private final JTable recordsTable = new JTable(recordsModel);
     private final JTextField keyword = new JTextField();
+    private final JLabel activeLoansValue = new JLabel("-");
+    private final JLabel dueSoonValue = new JLabel("-");
+    private final JLabel overdueValue = new JLabel("-");
+    private final JLabel fineValue = new JLabel("-");
 
     StudentPanel(MainFrame frame, LoginSession session, LibraryService service) {
         this.session = session;
@@ -824,6 +874,8 @@ final class StudentPanel extends JPanel {
         logout.addActionListener(e -> frame.showLogin());
         sidebar.add(player);
         sidebar.add(Box.createVerticalStrut(18));
+        sidebar.add(studentStatsPanel());
+        sidebar.add(Box.createVerticalStrut(18));
         sidebar.add(books);
         sidebar.add(Box.createVerticalStrut(10));
         sidebar.add(records);
@@ -840,7 +892,10 @@ final class StudentPanel extends JPanel {
     }
 
     private JPanel bookTab() {
-        JPanel panel = Ui.page("查詢與借書", "搜尋館藏、選擇借閱天數，按下借書即可建立紀錄。");
+        BorrowPolicy policy = BorrowPolicy.forRole(session.roleLevel());
+        String subtitle = "搜尋館藏、選擇借閱天數，按下借書即可建立紀錄。"
+                + session.roleLevel() + " 同時最多可借 " + policy.maxLoans() + " 本。";
+        JPanel panel = Ui.page("查詢與借書", subtitle);
         JPanel topStack = new JPanel(new BorderLayout(0, 10));
         JPanel top = Ui.toolbar();
         JLabel searchLabel = new JLabel("關鍵字");
@@ -854,7 +909,7 @@ final class StudentPanel extends JPanel {
         top.add(searchLabel, BorderLayout.WEST);
         top.add(keyword, BorderLayout.CENTER);
         top.add(search, BorderLayout.EAST);
-        topStack.add(Ui.pageHeader("查詢與借書", "搜尋館藏、選擇借閱天數，按下借書即可建立紀錄。"), BorderLayout.NORTH);
+        topStack.add(Ui.pageHeader("查詢與借書", subtitle), BorderLayout.NORTH);
         topStack.add(top, BorderLayout.SOUTH);
         panel.add(topStack, BorderLayout.NORTH);
         panel.add(new JScrollPane(booksTable), BorderLayout.CENTER);
@@ -905,6 +960,36 @@ final class StudentPanel extends JPanel {
         return panel;
     }
 
+    private JPanel studentStatsPanel() {
+        JPanel panel = new JPanel(new GridLayout(5, 2, 6, 8));
+        panel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 170));
+        panel.setBorder(BorderFactory.createCompoundBorder(
+                new PixelBorder(Ui.STONE_DARK, Ui.STONE_LIGHT, 2),
+                new EmptyBorder(10, 10, 10, 10)));
+        JLabel title = new JLabel("借閱狀態");
+        title.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 16));
+        panel.add(title);
+        panel.add(new JLabel(""));
+        panel.add(new JLabel("借閱中"));
+        panel.add(activeLoansValue);
+        panel.add(new JLabel("即將到期"));
+        panel.add(dueSoonValue);
+        panel.add(new JLabel("逾期"));
+        panel.add(overdueValue);
+        panel.add(new JLabel("模擬罰款"));
+        panel.add(fineValue);
+        activeLoansValue.setHorizontalAlignment(SwingConstants.RIGHT);
+        dueSoonValue.setHorizontalAlignment(SwingConstants.RIGHT);
+        overdueValue.setHorizontalAlignment(SwingConstants.RIGHT);
+        fineValue.setHorizontalAlignment(SwingConstants.RIGHT);
+        activeLoansValue.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 15));
+        dueSoonValue.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 15));
+        overdueValue.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 15));
+        fineValue.setFont(new Font("Microsoft JhengHei UI", Font.BOLD, 15));
+        return panel;
+    }
+
     private void refreshBooks() {
         try {
             booksModel.setRowCount(0);
@@ -920,13 +1005,40 @@ final class StudentPanel extends JPanel {
     private void refreshRecords() {
         try {
             recordsModel.setRowCount(0);
-            for (BorrowRow r : service.borrowRows(session.id())) {
+            List<BorrowRow> rows = service.borrowRows(session.id());
+            for (BorrowRow r : rows) {
                 recordsModel.addRow(new Object[]{r.recordId(), r.title(), r.borrowDate(), r.dueDate(),
                         r.returnDate(), r.borrowDays(), r.overdueDays(), r.fineText(), r.statusText()});
             }
+            refreshStudentStats(rows);
         } catch (SQLException ex) {
             Dialogs.error(this, ex);
         }
+    }
+
+    private void refreshStudentStats(List<BorrowRow> rows) {
+        BorrowPolicy policy = BorrowPolicy.forRole(session.roleLevel());
+        int activeLoans = 0;
+        int dueSoon = 0;
+        int overdue = 0;
+        int fineAmount = 0;
+        LocalDateTime now = LocalDateTime.now();
+        for (BorrowRow row : rows) {
+            if (row.returnDate() != null) {
+                continue;
+            }
+            activeLoans++;
+            if (row.overdueDays() > 0) {
+                overdue++;
+                fineAmount += row.fineAmount();
+            } else if (!row.dueDate().toLocalDateTime().isAfter(now.plusDays(3))) {
+                dueSoon++;
+            }
+        }
+        activeLoansValue.setText(activeLoans + " / " + policy.maxLoans());
+        dueSoonValue.setText(String.valueOf(dueSoon));
+        overdueValue.setText(String.valueOf(overdue));
+        fineValue.setText(fineAmount == 0 ? "0 元" : fineAmount + " 元");
     }
 }
 
