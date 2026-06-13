@@ -85,6 +85,14 @@ INSERT INTO users (student_no, name, password_hash, role_level)
 SELECT 'B001', 'Demo Student', SHA2('1234', 256), 'NORMAL'
 WHERE NOT EXISTS (SELECT 1 FROM users WHERE student_no = 'B001');
 
+INSERT INTO users (student_no, name, password_hash, role_level)
+SELECT 'B002', 'VIP Student', SHA2('1234', 256), 'VIP'
+WHERE NOT EXISTS (SELECT 1 FROM users WHERE student_no = 'B002');
+
+INSERT INTO users (student_no, name, password_hash, role_level, status)
+SELECT 'B003', 'Suspended Student', SHA2('1234', 256), 'NORMAL', 'SUSPENDED'
+WHERE NOT EXISTS (SELECT 1 FROM users WHERE student_no = 'B003');
+
 INSERT INTO books (title, authors, subjects, publisher, publish_year, edition, format_desc, source, note, total_copies, available_copies)
 SELECT 'Effective Java', 'Joshua Bloch', 'Java, Programming', 'Addison-Wesley', '2018', '3rd', 'Paperback', 'Seed', 'Java programming classic', 3, 3
 WHERE NOT EXISTS (SELECT 1 FROM books WHERE title = 'Effective Java');
@@ -132,3 +140,67 @@ FROM (
   UNION ALL SELECT '投資理財基礎', '劉宗翰', 'Investment, Finance, Personal Finance', '財富管理出版', '2025', 4, 4
 ) AS seed
 WHERE NOT EXISTS (SELECT 1 FROM books WHERE books.title = seed.title);
+
+INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, return_date, borrow_days, created_at)
+SELECT u.user_id, b.book_id, '2026-05-10 10:00:00', '2026-05-17 10:00:00',
+       '2026-05-16 15:30:00', 7, '2026-05-10 10:00:00'
+FROM users u
+JOIN books b ON b.title = '資料庫系統導論'
+WHERE u.student_no = 'B002'
+  AND NOT EXISTS (
+    SELECT 1 FROM borrow_records r
+    WHERE r.user_id = u.user_id
+      AND r.book_id = b.book_id
+      AND r.borrow_date = '2026-05-10 10:00:00'
+  );
+
+INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, return_date, borrow_days, created_at)
+SELECT u.user_id, b.book_id, '2026-05-20 09:00:00', '2026-05-27 09:00:00',
+       '2026-05-29 11:00:00', 7, '2026-05-20 09:00:00'
+FROM users u
+JOIN books b ON b.title = '作業系統概論'
+WHERE u.student_no = 'B003'
+  AND NOT EXISTS (
+    SELECT 1 FROM borrow_records r
+    WHERE r.user_id = u.user_id
+      AND r.book_id = b.book_id
+      AND r.borrow_date = '2026-05-20 09:00:00'
+  );
+
+INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, return_date, borrow_days, created_at)
+SELECT u.user_id, b.book_id, '2026-06-01 14:00:00', '2026-06-08 14:00:00',
+       NULL, 7, '2026-06-01 14:00:00'
+FROM users u
+JOIN books b ON b.title = 'Effective Java'
+WHERE u.student_no = 'B001'
+  AND NOT EXISTS (
+    SELECT 1 FROM borrow_records r
+    WHERE r.user_id = u.user_id
+      AND r.book_id = b.book_id
+      AND r.borrow_date = '2026-06-01 14:00:00'
+  );
+
+INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, return_date, borrow_days, created_at)
+SELECT u.user_id, b.book_id, '2026-06-10 16:00:00', '2026-06-24 16:00:00',
+       NULL, 14, '2026-06-10 16:00:00'
+FROM users u
+JOIN books b ON b.title = 'Python 自動化實務'
+WHERE u.student_no = 'B002'
+  AND NOT EXISTS (
+    SELECT 1 FROM borrow_records r
+    WHERE r.user_id = u.user_id
+      AND r.book_id = b.book_id
+      AND r.borrow_date = '2026-06-10 16:00:00'
+  );
+
+UPDATE books b
+LEFT JOIN (
+  SELECT book_id, COUNT(*) AS active_loans
+  FROM borrow_records
+  WHERE return_date IS NULL
+  GROUP BY book_id
+) r ON b.book_id = r.book_id
+SET b.available_copies = CASE
+  WHEN b.status = 'ARCHIVED' THEN 0
+  ELSE GREATEST(b.total_copies - COALESCE(r.active_loans, 0), 0)
+END;
