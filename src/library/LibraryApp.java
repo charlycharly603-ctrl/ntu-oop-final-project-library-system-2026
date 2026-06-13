@@ -6,6 +6,9 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableModel;
 import javax.swing.table.JTableHeader;
 import java.awt.*;
+import java.io.File;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.security.MessageDigest;
 import java.sql.*;
 import java.time.LocalDateTime;
@@ -13,7 +16,9 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
+import java.util.logging.Logger;
 
 public class LibraryApp {
     public static void main(String[] args) {
@@ -112,17 +117,113 @@ final class Db {
         String url = env("LIB_DB_URL", DEFAULT_URL);
         String user = env("LIB_DB_USER", "library_app");
         String password = env("LIB_DB_PASSWORD", "");
+        ensureMysqlDriver();
+        return DriverManager.getConnection(url, user, password);
+    }
+
+    private static void ensureMysqlDriver() throws SQLException {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
-        } catch (ClassNotFoundException ignored) {
-            // DriverManager can still locate the driver when the jar is on the classpath.
+        } catch (ClassNotFoundException ex) {
+            loadDriverFromLib();
         }
-        return DriverManager.getConnection(url, user, password);
+    }
+
+    private static void loadDriverFromLib() throws SQLException {
+        File jar = findConnectorJar();
+        if (jar == null) {
+            throw new SQLException("找不到 MySQL Connector/J，請確認 lib 資料夾內有 mysql-connector-j-*.jar");
+        }
+        try {
+            URL[] urls = new URL[]{jar.toURI().toURL()};
+            URLClassLoader loader = new URLClassLoader(urls, Db.class.getClassLoader());
+            Driver driver = (Driver) Class.forName("com.mysql.cj.jdbc.Driver", true, loader)
+                    .getDeclaredConstructor()
+                    .newInstance();
+            DriverManager.registerDriver(new DriverShim(driver));
+        } catch (Exception ex) {
+            throw new SQLException("無法載入 MySQL Connector/J：" + ex.getMessage(), ex);
+        }
+    }
+
+    private static File findConnectorJar() {
+        List<File> libDirs = new ArrayList<>();
+        addLibDirsFrom(new File(System.getProperty("user.dir")), libDirs);
+        addLibDirsFrom(new File(System.getProperty("user.home"), "Desktop/JavaFinalProject"), libDirs);
+        try {
+            File codePath = new File(Db.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            if (codePath.isDirectory()) {
+                addLibDirsFrom(codePath, libDirs);
+            }
+        } catch (Exception ignored) {
+        }
+        for (File libDir : libDirs) {
+            File[] jars = libDir.listFiles((dir, name) ->
+                    name.toLowerCase().startsWith("mysql-connector-j-") && name.toLowerCase().endsWith(".jar"));
+            if (jars != null && jars.length > 0) {
+                return jars[0];
+            }
+        }
+        return null;
+    }
+
+    private static void addLibDirsFrom(File start, List<File> libDirs) {
+        File current = start;
+        while (current != null) {
+            File libDir = new File(current, "lib");
+            if (!libDirs.contains(libDir)) {
+                libDirs.add(libDir);
+            }
+            current = current.getParentFile();
+        }
     }
 
     private static String env(String key, String fallback) {
         String value = System.getenv(key);
         return value == null || value.isBlank() ? fallback : value;
+    }
+}
+
+final class DriverShim implements Driver {
+    private final Driver driver;
+
+    DriverShim(Driver driver) {
+        this.driver = driver;
+    }
+
+    @Override
+    public Connection connect(String url, Properties info) throws SQLException {
+        return driver.connect(url, info);
+    }
+
+    @Override
+    public boolean acceptsURL(String url) throws SQLException {
+        return driver.acceptsURL(url);
+    }
+
+    @Override
+    public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) throws SQLException {
+        return driver.getPropertyInfo(url, info);
+    }
+
+    @Override
+    public int getMajorVersion() {
+        return driver.getMajorVersion();
+    }
+
+    @Override
+    public int getMinorVersion() {
+        return driver.getMinorVersion();
+    }
+
+    @Override
+    public boolean jdbcCompliant() {
+        return driver.jdbcCompliant();
+    }
+
+    @Override
+    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+        return driver.getParentLogger();
     }
 }
 
@@ -321,8 +422,14 @@ final class LibraryService {
                     ps.setInt(1, recordId);
                     ps.executeUpdate();
                 }
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "UPDATE books SET available_copies = available_copies + 1 WHERE book_id = ?")) {
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        UPDATE books
+                        SET available_copies = CASE
+                            WHEN status = 'AVAILABLE' THEN available_copies + 1
+                            ELSE available_copies
+                        END
+                        WHERE book_id = ?
+                        """)) {
                     ps.setInt(1, bookId);
                     ps.executeUpdate();
                 }

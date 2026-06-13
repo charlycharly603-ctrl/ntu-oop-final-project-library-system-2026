@@ -23,7 +23,7 @@
 
 1. 安裝 MySQL。
 2. 執行 `database/schema.sql` 建立資料庫與示範資料。
-3. 下載 MySQL Connector/J，將 jar 放到 `lib/`。
+3. 確認 `lib/` 內有 MySQL Connector/J。本專案已附 `lib/mysql-connector-j-9.7.0.jar`，若遺失再重新下載放回 `lib/`。
 
 如果已經建立過舊版資料庫，請重新執行 `database/schema.sql`。它會替 `books` 補上 `status` 欄位，讓下架書籍可以保留歷史借閱紀錄。
 
